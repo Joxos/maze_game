@@ -1,0 +1,8 @@
+# 本机沙箱 TLS(schannel) 不可用，cargo 无法直连 crates.io。
+# 依赖已全部 vendor 到 ./vendor（用 tools/fetch-vendor.mjs 拉取，SHA256 已校验），
+# 因此本项目完全离线构建。网络正常的环境可直接删除本文件与 vendor/ 目录使用 crates.io。
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"
