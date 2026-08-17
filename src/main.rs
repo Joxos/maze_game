@@ -17,14 +17,16 @@ use std::collections::HashSet;
 
 use macroquad::prelude::*;
 
-use maze::{Maze, E, N, S, W};
+use maze::{opposite, Maze, E, N, S, W};
 
 /// 顶部 HUD 区域高度
 const HUD_H: f32 = 78.0;
 /// 每步移动动画时长（秒）
 const MOVE_TIME: f32 = 0.12;
-/// 视野射线数量（360° 均分）
-const VISION_RAYS: usize = 720;
+/// 视野射线数量（360° 均分，0.25°/条）。
+/// 角分辨率决定了"掠射角"墙段（与视线近乎平行的远墙）能否被命中，
+/// 漏网墙段另有中点补射兜底（见 compute_vision），双保险。
+const VISION_RAYS: usize = 1440;
 
 // ---- 配色 ----
 const BG: Color = Color::new(0.063, 0.075, 0.122, 1.0); // 背景
@@ -267,6 +269,97 @@ fn light_at(d: f32, range: f32) -> f32 {
     (1.0 - tt).powf(1.6)
 }
 
+/// 从 (ox,oy) 向墙段中点 (mx,my) 发射单条精确射线（DDA 步进），
+/// 目标是 (wx,wy) 格 dir 方向的墙段。
+/// - 先跨过其他墙 → None（被遮挡，不可见）
+/// - 跨过目标墙段 → Some(命中距离)
+/// 用于兜底角分辨率漏掉的"掠射角"远墙：中点射线精确指向墙段，
+/// 不存在角度采样间隙，且与扇形射线一样遵守墙体遮挡（不产生泄漏）。
+fn ray_to(
+    maze: &Maze,
+    ox: f32,
+    oy: f32,
+    mx: f32,
+    my: f32,
+    wx: usize,
+    wy: usize,
+    wdir: usize,
+) -> Option<f32> {
+    let (vx, vy) = (mx - ox, my - oy);
+    let total = (vx * vx + vy * vy).sqrt();
+    if total < 1e-6 {
+        return None;
+    }
+    let (dx, dy) = (vx / total, vy / total);
+    let w = maze.width as i32;
+    let h = maze.height as i32;
+    let (mut x, mut y) = (ox, oy);
+    let (mut cx, mut cy) = (x.floor() as i32, y.floor() as i32);
+    let mut t = 0.0;
+
+    loop {
+        if cx < 0 || cy < 0 || cx >= w || cy >= h {
+            return None;
+        }
+        let tx = if dx > 0.0 {
+            (cx as f32 + 1.0 - x) / dx
+        } else if dx < 0.0 {
+            (cx as f32 - x) / dx
+        } else {
+            f32::INFINITY
+        };
+        let ty = if dy > 0.0 {
+            (cy as f32 + 1.0 - y) / dy
+        } else if dy < 0.0 {
+            (cy as f32 - y) / dy
+        } else {
+            f32::INFINITY
+        };
+
+        let (dt, dir) = if tx <= ty {
+            (tx, if dx > 0.0 { E } else { W })
+        } else {
+            (ty, if dy > 0.0 { S } else { N })
+        };
+        if !(dt > 0.0) || t + dt > total + 1e-4 {
+            return None; // 越过目标点仍未跨过目标墙段
+        }
+
+        let (nx, ny) = match dir {
+            E => (cx + 1, cy),
+            W => (cx - 1, cy),
+            S => (cx, cy + 1),
+            N => (cx, cy - 1),
+            _ => unreachable!(),
+        };
+
+        // 跨过的边是否就是目标墙段（两侧方向都算同一面物理墙）
+        let is_target = (cx as usize == wx && cy as usize == wy && dir == wdir)
+            || (nx as usize == wx && ny as usize == wy && dir == opposite(wdir));
+        if is_target {
+            return Some(t + dt);
+        }
+
+        if nx < 0 || ny < 0 || nx >= w || ny >= h {
+            return None; // 撞到其他外墙
+        }
+        if maze.wall(cx as usize, cy as usize, dir) {
+            return None; // 撞到其他墙，被遮挡
+        }
+
+        x += dx * dt;
+        y += dy * dt;
+        t += dt;
+        match dir {
+            E => cx += 1,
+            W => cx -= 1,
+            S => cy += 1,
+            N => cy -= 1,
+            _ => unreachable!(),
+        }
+    }
+}
+
 /// 视野计算：从玩家位置向 360° 均匀发射射线，用 DDA 连续步进
 /// （精确到下一格线），逐格漫游：
 /// - 跨格时检查所跨的那面墙（精确到墙段）：有墙则记录"这面墙在距离 t
@@ -393,6 +486,46 @@ fn compute_vision(maze: &Maze, ox: f32, oy: f32) -> Vision {
             } else {
                 0.0
             };
+        }
+    }
+
+    // 中点补射兜底：扇形射线的角分辨率在"掠射角"（与视线近乎平行的远墙）
+    // 下会漏掉整面墙——对每个"邻接被照亮格子但未被任何射线命中"的墙段，
+    // 从玩家向墙段中点发射一条精确射线。中点射线不存在角度间隙，
+    // 且同样遵守墙体遮挡（被挡住的墙段依然不可见，不产生泄漏）。
+    for y in 0..h {
+        for x in 0..w {
+            for dir in [N, E, S, W] {
+                let wi = (x + y * w) * 4 + dir;
+                if wall_hits[wi].is_finite() {
+                    continue; // 已被扇形射线命中
+                }
+                let (nx, ny) = match dir {
+                    N => (x, y.wrapping_sub(1)),
+                    S => (x, y + 1),
+                    W => (x.wrapping_sub(1), y),
+                    E => (x + 1, y),
+                    _ => unreachable!(),
+                };
+                let lit_here = cell_light[x + y * w] > 0.0;
+                let lit_there = nx < w && ny < h && cell_light[nx + ny * w] > 0.0;
+                if !lit_here && !lit_there {
+                    continue; // 两侧都不亮：不可见，无需补射
+                }
+                // 墙段中点
+                let (mx, my) = match dir {
+                    N => (x as f32 + 0.5, y as f32),
+                    S => (x as f32 + 0.5, y as f32 + 1.0),
+                    W => (x as f32, y as f32 + 0.5),
+                    E => (x as f32 + 1.0, y as f32 + 0.5),
+                    _ => unreachable!(),
+                };
+                if let Some(d) = ray_to(maze, ox, oy, mx, my, x, y, dir) {
+                    if d <= range && d < wall_hits[wi] {
+                        wall_hits[wi] = d;
+                    }
+                }
+            }
         }
     }
 
@@ -711,7 +844,44 @@ mod tests {
             "wall W2 far side leaks through W1"
         );
         assert!(!vision.wall_hits[wi(2, 0, S, w)].is_finite(), "wall (2,0,S) far side leaks");
-        // 走廊深处（光线到不了）的墙段同样不可见
-        assert!(!vision.wall_hits[wi(4, 1, E, w)].is_finite(), "far corridor end wall should be invisible");
+    }
+
+    /// 场景 3（掠射角漏墙回归）：25x25 迷宫只有第 12 行是一条 25 格长的直走廊，
+    /// 玩家在走廊西端。走廊侧墙与视线近乎平行，是扇形射线角分辨率最容易
+    /// 漏掉的"掠射角"远墙——旧实现（720 条射线）下 9、10 格外侧墙的角宽
+    /// 不足 0.4°，整面墙落在两条射线之间、从未被命中而消失。
+    /// 修复后（更密射线 + 中点补射兜底）这些墙必须可见。
+    #[test]
+    fn vision_glancing_angle_walls_are_visible() {
+        let w = 25;
+        let h = 25;
+        let mut open = Vec::new();
+        for x in 0..w - 1 {
+            open.push((x, 12, E));
+        }
+        let maze = test_maze(w, h, &open);
+        let vision = compute_vision(&maze, 0.5, 12.5);
+
+        // 走廊侧墙（掠射角）在远处必须可见
+        for x in 8..=11 {
+            assert!(
+                vision.wall_hits[wi(x, 12, S, w)].is_finite(),
+                "far corridor side wall ({},12,S) missing at glancing angle",
+                x
+            );
+        }
+        // 超出视野半径（12 格）的侧墙按设计不可见（迷雾边缘）
+        assert!(
+            !vision.wall_hits[wi(12, 12, S, w)].is_finite(),
+            "wall beyond fog range should stay invisible"
+        );
+        // 走廊格子被照亮
+        assert!(vision.cell_light[10 + 12 * w] > 0.01, "corridor cell (10,12) should be lit");
+        // 深处暗格依然严格全黑、深处墙不可见
+        assert_eq!(vision.cell_light[5 + 5 * w], 0.0, "dark cell (5,5) leaks light");
+        assert!(
+            !vision.wall_hits[wi(5, 5, E, w)].is_finite(),
+            "deep wall should stay invisible"
+        );
     }
 }
