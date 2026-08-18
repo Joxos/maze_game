@@ -12,15 +12,17 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod maze;
+mod maze_gen;
 
 use std::collections::HashSet;
 
 use macroquad::prelude::*;
 
 use maze::{opposite, Maze, E, N, S, W};
+use maze_gen::Generator;
 
 /// 顶部 HUD 区域高度
-const HUD_H: f32 = 78.0;
+const HUD_H: f32 = 96.0;
 /// 每步移动动画时长（秒）
 const MOVE_TIME: f32 = 0.12;
 /// 视野射线数量（360° 均分，0.25°/条）。
@@ -77,6 +79,10 @@ struct Game {
     fog: bool,
     /// 已通关次数（决定迷宫大小与关卡编号）
     wins: u32,
+    /// 当前迷宫生成算法（G 键切换）
+    gen: Generator,
+    /// 环状结构开关（L 键切换，拆墙成环后"贴墙走"不再保证通关）
+    loops: bool,
     /// 当前迷宫的 BFS 最优解
     solution: Vec<(usize, usize)>,
     /// 视野计算结果（迷雾开启时每帧更新）
@@ -86,9 +92,15 @@ struct Game {
 }
 
 impl Game {
-    fn new(wins: u32) -> Self {
+    fn new(wins: u32, gen: Generator, loops: bool) -> Self {
         let size = (15 + 2 * wins.min(8) as usize).min(31);
-        let maze = Maze::new(size, size);
+        // 环数 ≈ 5% 格子数（至少 4 个），避开死胡同拆墙，支路全保留
+        let loop_count = if loops {
+            Some(((size * size * 5) / 100).max(4))
+        } else {
+            None
+        };
+        let maze = maze_gen::generate(size, gen, loop_count);
         let mut visited = HashSet::new();
         visited.insert((0, 0));
         let solution = maze.solve((0, 0), (size - 1, size - 1));
@@ -106,6 +118,8 @@ impl Game {
             show_solution: false,
             fog: true,
             wins,
+            gen,
+            loops,
             solution,
             vision,
             player_pos: (0.5, 0.5),
@@ -132,7 +146,8 @@ async fn main() {
     // 不再被输入法拼音合成截获；Windows 后端在窗口重新聚焦时也不会重新打开 IME。
     miniquad::window::set_ime_enabled(false);
 
-    let mut game = Game::new(0);
+    // 默认玩法：调研推荐的组合——Randomized Prim（支路密集）+ 环状化
+    let mut game = Game::new(0, Generator::RandomizedPrim, true);
     loop {
         update(&mut game);
         draw(&game);
@@ -151,8 +166,20 @@ fn update(g: &mut Game) {
             State::Won => State::Won,
         };
     }
+    // R：同算法重新生成新迷宫
     if is_key_pressed(KeyCode::R) {
-        *g = Game::new(g.wins);
+        *g = Game::new(g.wins, g.gen, g.loops);
+        return;
+    }
+    // G：切换到下一个生成算法并立即重新生成
+    if is_key_pressed(KeyCode::G) {
+        let next = g.gen.next();
+        *g = Game::new(g.wins, next, g.loops);
+        return;
+    }
+    // L：环状结构开关（拆墙成环，每拆一面墙新增一个独立环）
+    if is_key_pressed(KeyCode::L) {
+        *g = Game::new(g.wins, g.gen, !g.loops);
         return;
     }
     if is_key_pressed(KeyCode::F) {
@@ -672,7 +699,7 @@ fn draw(g: &Game) {
         draw_win(g);
     }
     if g.state == State::Paused {
-        draw_pause();
+        draw_pause(g);
     }
 }
 
@@ -694,13 +721,26 @@ fn draw_hud(g: &Game) {
     draw_text(&format!("Time {:.1}s", g.time), 16.0, 32.0, 28.0, TEXT);
     draw_text(&format!("Moves {}", g.moves), 16.0, 60.0, 22.0, TEXT_DIM);
 
-    let title = format!("Level {}  -  Maze {}x{}", g.wins + 1, g.maze.width, g.maze.height);
+    let title = format!(
+        "Level {}  -  Maze {}x{}  -  {}",
+        g.wins + 1,
+        g.maze.width,
+        g.maze.height,
+        g.gen.name()
+    );
     let tw = measure_text(&title, None, 26, 1.0).width;
     draw_text(&title, (sw - tw) / 2.0, 36.0, 26.0, TEXT);
 
-    let hint = "Arrows/WASD move    R new maze    H solution    F fog    Tab peek    Esc pause";
-    let hw = measure_text(hint, None, 18, 1.0).width;
-    draw_text(hint, (sw - hw) / 2.0, 62.0, 18.0, TEXT_DIM);
+    let hint1 = format!(
+        "Arrows/WASD move    R new maze    G algorithm    L loops:{}",
+        if g.loops { "On" } else { "Off" }
+    );
+    let h1w = measure_text(&hint1, None, 18, 1.0).width;
+    draw_text(&hint1, (sw - h1w) / 2.0, 60.0, 18.0, TEXT_DIM);
+
+    let hint2 = "H solution    F fog    Tab peek    Esc pause";
+    let h2w = measure_text(hint2, None, 18, 1.0).width;
+    draw_text(hint2, (sw - h2w) / 2.0, 84.0, 18.0, TEXT_DIM);
 }
 
 fn draw_win(g: &Game) {
@@ -728,7 +768,7 @@ fn draw_win(g: &Game) {
     draw_text(&again, (sw - aw) / 2.0, sh * 0.40 + 100.0, 22.0, TEXT_DIM);
 }
 
-fn draw_pause() {
+fn draw_pause(g: &Game) {
     let sw = screen_width();
     let sh = screen_height();
 
@@ -736,15 +776,31 @@ fn draw_pause() {
 
     let title = "PAUSED";
     let tw = measure_text(title, None, 56, 1.0).width;
-    draw_text(title, (sw - tw) / 2.0, sh * 0.36, 56.0, TEXT);
+    draw_text(title, (sw - tw) / 2.0, sh * 0.34, 56.0, TEXT);
 
-    let opts = ["Esc - Resume", "R - New Maze", "Q - Quit"];
+    let info = format!(
+        "Generator: {}    Loops: {}",
+        g.gen.name(),
+        if g.loops { "On" } else { "Off" }
+    );
+    let iw = measure_text(&info, None, 24, 1.0).width;
+    draw_text(&info, (sw - iw) / 2.0, sh * 0.34 + 52.0, 24.0, TEXT_DIM);
+
+    let stats = format!(
+        "Cycles: {}    Dead ends: {}",
+        maze_gen::cycle_count(&g.maze),
+        maze_gen::dead_end_count(&g.maze)
+    );
+    let sw2 = measure_text(&stats, None, 22, 1.0).width;
+    draw_text(&stats, (sw - sw2) / 2.0, sh * 0.34 + 82.0, 22.0, TEXT_DIM);
+
+    let opts = ["Esc - Resume", "R - New Maze", "G - Next generator", "Q - Quit"];
     for (i, line) in opts.iter().enumerate() {
         let lw = measure_text(line, None, 26, 1.0).width;
         draw_text(
             line,
             (sw - lw) / 2.0,
-            sh * 0.36 + 64.0 + i as f32 * 44.0,
+            sh * 0.34 + 124.0 + i as f32 * 44.0,
             26.0,
             if i == 0 { TEXT } else { TEXT_DIM },
         );
