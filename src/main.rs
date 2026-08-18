@@ -32,6 +32,8 @@ const VISION_RAYS: usize = 1440;
 /// 相机视口可显示的格子数（宽 x 高）：镜头跟随玩家，迷宫再大也只画视口内
 const VIEW_COLS: f32 = 21.0;
 const VIEW_ROWS: f32 = 19.0;
+/// 相机跟随速度（每秒向玩家位置逼近的比例系数，指数缓动、帧率无关）
+const CAMERA_SPEED: f32 = 10.0;
 
 // ---- 配色 ----
 const BG: Color = Color::new(0.063, 0.075, 0.122, 1.0); // 背景
@@ -94,6 +96,8 @@ struct Game {
     vision: Vision,
     /// 插值后的玩家位置（格子坐标，含 0.5 中心偏移）
     player_pos: (f32, f32),
+    /// 相机中心（格子坐标，指数缓动平滑跟随玩家）
+    camera: (f32, f32),
 }
 
 impl Game {
@@ -131,6 +135,7 @@ impl Game {
             solution,
             vision,
             player_pos: (0.5, 0.5),
+            camera: (0.5, 0.5),
         }
     }
 
@@ -275,6 +280,11 @@ fn update(g: &mut Game) {
     } else {
         g.vision = full_vision(&g.maze);
     }
+
+    // 相机平滑跟随玩家：玩家恒在视口中心附近，镜头始终缓动追赶（指数逼近，帧率无关）
+    let k = 1.0 - (-dt * CAMERA_SPEED).exp();
+    g.camera.0 += (g.player_pos.0 - g.camera.0) * k;
+    g.camera.1 += (g.player_pos.1 - g.camera.1) * k;
 }
 
 /// 当前按下的移动方向（WASD / 方向键）
@@ -594,8 +604,7 @@ fn compute_vision(maze: &Maze, ox: f32, oy: f32) -> Vision {
 // ---------- 渲染 ----------
 
 /// 相机布局：格子像素尺寸 + 相机中心（格子坐标）。
-/// 相机锁定在玩家插值位置（移动动画内也平滑跟随），并夹取在迷宫边界内；
-/// 迷宫小于视口时居中显示。
+/// 相机由 update 平滑跟随玩家（无边界夹取，玩家恒在视口中心）。
 fn layout(g: &Game) -> (f32, f32, f32) {
     let sw = screen_width();
     let sh = screen_height();
@@ -605,22 +614,7 @@ fn layout(g: &Game) -> (f32, f32, f32) {
         .min(avail_h / VIEW_ROWS)
         .floor()
         .max(20.0);
-    let (px, py) = g.player_pos;
-    let half_w = avail_w / (2.0 * cell); // 视口半宽（格子数）
-    let half_h = avail_h / (2.0 * cell);
-    let w = g.maze.width as f32;
-    let h = g.maze.height as f32;
-    let cam_x = if w <= 2.0 * half_w {
-        w / 2.0 // 迷宫比视口小：居中
-    } else {
-        px.clamp(half_w, w - half_w)
-    };
-    let cam_y = if h <= 2.0 * half_h {
-        h / 2.0
-    } else {
-        py.clamp(half_h, h - half_h)
-    };
-    (cell, cam_x, cam_y)
+    (cell, g.camera.0, g.camera.1)
 }
 
 fn smoothstep(t: f32) -> f32 {
