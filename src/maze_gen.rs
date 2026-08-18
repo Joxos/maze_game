@@ -10,7 +10,7 @@
 //! | Kruskal（并查集随机合并） | 30.3 | 26.2 | 1.8 | 142 |
 //! | Wilson（loop-erased 随机游走） | 29.1 | 25.5 | 1.8 | 163 |
 //! | AldousBroder（随机游走） | 29.2 | 25.6 | 1.8 | 162 |
-//! | GrowingTree（生长树，50%最新/50%随机） | 21.7 | 19.9 | 2.5 | 164 |
+//! | GrowingTree（生长树，newest 比例可调；50% 实测） | 21.7 | 19.9 | 2.5 | 164 |
 //!
 //! 环状化（`carve_loops`）：在生成树上随机拆墙，每拆一面内部墙恰好新增
 //! 一个独立环；`avoid_deadends=true` 时跳过与死胡同相邻的墙，支路完整
@@ -32,9 +32,14 @@ pub enum Generator {
     Wilson,
     /// Aldous-Broder：朴素随机游走，无偏但较慢
     AldousBroder,
-    /// 生长树：按"最新/随机"比例选取活跃格，支路度可调
-    GrowingTree,
+    /// 生长树：按"最新/随机"比例选取活跃格，支路度可调；
+    /// `newest_ratio` = 取"最新格"的百分比（0≈Prim 风格，100≈DFS 风格）
+    GrowingTree { newest_ratio: u8 },
 }
+
+/// 生长树默认"取最新格"比例（%）：60% 介于 50% 实测（死胡同 21.7%、河道 2.5）
+/// 与 75% 实测（死胡同 15.8%、河道 3.5）之间，偏长通道的平衡档，适合迷雾玩法。
+pub const DEFAULT_GT_RATIO: u8 = 60;
 
 impl Generator {
     /// 全部算法（循环顺序）
@@ -44,7 +49,9 @@ impl Generator {
         Generator::Kruskal,
         Generator::Wilson,
         Generator::AldousBroder,
-        Generator::GrowingTree,
+        Generator::GrowingTree {
+            newest_ratio: DEFAULT_GT_RATIO,
+        },
     ];
 
     /// 下一个算法（循环）
@@ -61,7 +68,27 @@ impl Generator {
             Generator::Kruskal => "Kruskal",
             Generator::Wilson => "Wilson",
             Generator::AldousBroder => "Aldous-Broder",
-            Generator::GrowingTree => "Growing Tree",
+            Generator::GrowingTree { .. } => "Growing Tree",
+        }
+    }
+
+    /// 带生长树比例的完整显示名（HUD / 暂停菜单用）
+    pub fn label(self) -> String {
+        match self {
+            Generator::GrowingTree { newest_ratio } => {
+                format!("Growing Tree ({}%)", newest_ratio)
+            }
+            other => other.name().to_string(),
+        }
+    }
+
+    /// 应用生长树比例（非生长树算法原样返回）
+    pub fn with_gt_ratio(self, ratio: u8) -> Generator {
+        match self {
+            Generator::GrowingTree { .. } => Generator::GrowingTree {
+                newest_ratio: ratio,
+            },
+            other => other,
         }
     }
 }
@@ -116,7 +143,9 @@ pub fn generate_seeded(size: usize, gen: Generator, loops: Option<usize>, seed: 
         Generator::Kruskal => gen_kruskal(&mut maze, &mut rng),
         Generator::Wilson => gen_wilson(&mut maze, &mut rng),
         Generator::AldousBroder => gen_aldous_broder(&mut maze, &mut rng),
-        Generator::GrowingTree => gen_growing_tree(&mut maze, &mut rng, 50),
+        Generator::GrowingTree { newest_ratio } => {
+            gen_growing_tree(&mut maze, &mut rng, newest_ratio as u64)
+        }
     }
     if let Some(count) = loops {
         carve_loops(&mut maze, &mut rng, count, true);
@@ -569,5 +598,44 @@ mod tests {
             g = g.next();
         }
         assert_eq!(g, Generator::ALL[0], "next() should cycle");
+    }
+
+    #[test]
+    fn growing_tree_ratio_tunes_branchiness() {
+        // newest 比例越低越接近 Prim（多支路），越高越接近 DFS（少支路）
+        let mut high = 0usize; // 90% 最新：少支路
+        let mut low = 0usize; // 10% 最新：多支路
+        for seed in 0..20u64 {
+            high += dead_end_count(&generate_seeded(
+                31,
+                Generator::GrowingTree { newest_ratio: 90 },
+                None,
+                seed,
+            ));
+            low += dead_end_count(&generate_seeded(
+                31,
+                Generator::GrowingTree { newest_ratio: 10 },
+                None,
+                seed,
+            ));
+        }
+        assert!(
+            low > high,
+            "low newest ratio should be branchier (low {} vs high {})",
+            low,
+            high
+        );
+    }
+
+    #[test]
+    fn with_gt_ratio_only_affects_growing_tree() {
+        let g = Generator::RandomizedPrim.with_gt_ratio(30);
+        assert_eq!(g, Generator::RandomizedPrim);
+        let g = Generator::GrowingTree { newest_ratio: 60 }.with_gt_ratio(30);
+        assert_eq!(g, Generator::GrowingTree { newest_ratio: 30 });
+        assert_eq!(
+            Generator::GrowingTree { newest_ratio: 30 }.label(),
+            "Growing Tree (30%)"
+        );
     }
 }

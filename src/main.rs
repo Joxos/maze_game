@@ -81,6 +81,8 @@ struct Game {
     wins: u32,
     /// 当前迷宫生成算法（G 键切换）
     gen: Generator,
+    /// 生长树 newest 比例（仅 GrowingTree 生效，[ ] 键调整）
+    gt_ratio: u8,
     /// 环状结构开关（L 键切换，拆墙成环后"贴墙走"不再保证通关）
     loops: bool,
     /// 当前迷宫的 BFS 最优解
@@ -92,8 +94,9 @@ struct Game {
 }
 
 impl Game {
-    fn new(wins: u32, gen: Generator, loops: bool) -> Self {
+    fn new(wins: u32, gen: Generator, loops: bool, gt_ratio: u8) -> Self {
         let size = (15 + 2 * wins.min(8) as usize).min(31);
+        let gen = gen.with_gt_ratio(gt_ratio);
         // 环数 ≈ 5% 格子数（至少 4 个），避开死胡同拆墙，支路全保留
         let loop_count = if loops {
             Some(((size * size * 5) / 100).max(4))
@@ -119,6 +122,7 @@ impl Game {
             fog: true,
             wins,
             gen,
+            gt_ratio,
             loops,
             solution,
             vision,
@@ -146,8 +150,15 @@ async fn main() {
     // 不再被输入法拼音合成截获；Windows 后端在窗口重新聚焦时也不会重新打开 IME。
     miniquad::window::set_ime_enabled(false);
 
-    // 默认玩法：调研推荐的组合——Randomized Prim（支路密集）+ 环状化
-    let mut game = Game::new(0, Generator::RandomizedPrim, true);
+    // 默认玩法：调研推荐的组合——生长树（60% 最新，支路/河道平衡）+ 环状化
+    let mut game = Game::new(
+        0,
+        Generator::GrowingTree {
+            newest_ratio: maze_gen::DEFAULT_GT_RATIO,
+        },
+        true,
+        maze_gen::DEFAULT_GT_RATIO,
+    );
     loop {
         update(&mut game);
         draw(&game);
@@ -168,18 +179,31 @@ fn update(g: &mut Game) {
     }
     // R：同算法重新生成新迷宫
     if is_key_pressed(KeyCode::R) {
-        *g = Game::new(g.wins, g.gen, g.loops);
+        *g = Game::new(g.wins, g.gen, g.loops, g.gt_ratio);
         return;
     }
     // G：切换到下一个生成算法并立即重新生成
     if is_key_pressed(KeyCode::G) {
         let next = g.gen.next();
-        *g = Game::new(g.wins, next, g.loops);
+        *g = Game::new(g.wins, next, g.loops, g.gt_ratio);
         return;
+    }
+    // [ ]：调整生长树 newest 比例（仅 GrowingTree 生效），±10%
+    if matches!(g.gen, Generator::GrowingTree { .. }) {
+        if is_key_pressed(KeyCode::LeftBracket) {
+            let r = g.gt_ratio.saturating_sub(10).max(10);
+            *g = Game::new(g.wins, g.gen, g.loops, r);
+            return;
+        }
+        if is_key_pressed(KeyCode::RightBracket) {
+            let r = (g.gt_ratio + 10).min(90);
+            *g = Game::new(g.wins, g.gen, g.loops, r);
+            return;
+        }
     }
     // L：环状结构开关（拆墙成环，每拆一面墙新增一个独立环）
     if is_key_pressed(KeyCode::L) {
-        *g = Game::new(g.wins, g.gen, !g.loops);
+        *g = Game::new(g.wins, g.gen, !g.loops, g.gt_ratio);
         return;
     }
     if is_key_pressed(KeyCode::F) {
@@ -726,7 +750,7 @@ fn draw_hud(g: &Game) {
         g.wins + 1,
         g.maze.width,
         g.maze.height,
-        g.gen.name()
+        g.gen.label()
     );
     let tw = measure_text(&title, None, 26, 1.0).width;
     draw_text(&title, (sw - tw) / 2.0, 36.0, 26.0, TEXT);
@@ -738,7 +762,7 @@ fn draw_hud(g: &Game) {
     let h1w = measure_text(&hint1, None, 18, 1.0).width;
     draw_text(&hint1, (sw - h1w) / 2.0, 60.0, 18.0, TEXT_DIM);
 
-    let hint2 = "H solution    F fog    Tab peek    Esc pause";
+    let hint2 = "H solution    F fog    [ ] tree ratio    Tab peek    Esc pause";
     let h2w = measure_text(hint2, None, 18, 1.0).width;
     draw_text(hint2, (sw - h2w) / 2.0, 84.0, 18.0, TEXT_DIM);
 }
@@ -780,7 +804,7 @@ fn draw_pause(g: &Game) {
 
     let info = format!(
         "Generator: {}    Loops: {}",
-        g.gen.name(),
+        g.gen.label(),
         if g.loops { "On" } else { "Off" }
     );
     let iw = measure_text(&info, None, 24, 1.0).width;
