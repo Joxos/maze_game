@@ -29,6 +29,9 @@ const MOVE_TIME: f32 = 0.12;
 /// 角分辨率决定了"掠射角"墙段（与视线近乎平行的远墙）能否被命中，
 /// 漏网墙段另有中点补射兜底（见 compute_vision），双保险。
 const VISION_RAYS: usize = 1440;
+/// 相机视口可显示的格子数（宽 x 高）：镜头跟随玩家，迷宫再大也只画视口内
+const VIEW_COLS: f32 = 21.0;
+const VIEW_ROWS: f32 = 19.0;
 
 // ---- 配色 ----
 const BG: Color = Color::new(0.063, 0.075, 0.122, 1.0); // 背景
@@ -95,7 +98,8 @@ struct Game {
 
 impl Game {
     fn new(wins: u32, gen: Generator, loops: bool, gt_ratio: u8) -> Self {
-        let size = (15 + 2 * wins.min(8) as usize).min(31);
+        // 10x10 起步，每通关一次长宽各 +5，上不封顶
+        let size = 10 + 5 * wins as usize;
         let gen = gen.with_gt_ratio(gt_ratio);
         // 环数 ≈ 5% 格子数（至少 4 个），避开死胡同拆墙，支路全保留
         let loop_count = if loops {
@@ -589,18 +593,34 @@ fn compute_vision(maze: &Maze, ox: f32, oy: f32) -> Vision {
 
 // ---------- 渲染 ----------
 
-/// 计算每个格子的像素尺寸与迷宫区域左上角坐标
+/// 相机布局：格子像素尺寸 + 相机中心（格子坐标）。
+/// 相机锁定在玩家插值位置（移动动画内也平滑跟随），并夹取在迷宫边界内；
+/// 迷宫小于视口时居中显示。
 fn layout(g: &Game) -> (f32, f32, f32) {
     let sw = screen_width();
     let sh = screen_height();
     let avail_w = sw - 24.0;
     let avail_h = sh - HUD_H - 24.0;
-    let cell = (avail_w / g.maze.width as f32)
-        .min(avail_h / g.maze.height as f32)
-        .floor();
-    let ox = (sw - cell * g.maze.width as f32) / 2.0;
-    let oy = HUD_H + (avail_h - cell * g.maze.height as f32) / 2.0;
-    (cell, ox, oy)
+    let cell = (avail_w / VIEW_COLS)
+        .min(avail_h / VIEW_ROWS)
+        .floor()
+        .max(20.0);
+    let (px, py) = g.player_pos;
+    let half_w = avail_w / (2.0 * cell); // 视口半宽（格子数）
+    let half_h = avail_h / (2.0 * cell);
+    let w = g.maze.width as f32;
+    let h = g.maze.height as f32;
+    let cam_x = if w <= 2.0 * half_w {
+        w / 2.0 // 迷宫比视口小：居中
+    } else {
+        px.clamp(half_w, w - half_w)
+    };
+    let cam_y = if h <= 2.0 * half_h {
+        h / 2.0
+    } else {
+        py.clamp(half_h, h - half_h)
+    };
+    (cell, cam_x, cam_y)
 }
 
 fn smoothstep(t: f32) -> f32 {
@@ -621,13 +641,30 @@ fn lerp_color(a: Color, b: Color, t: f32) -> Color {
 
 fn draw(g: &Game) {
     clear_background(BG);
-    let (cell, ox, oy) = layout(g);
+    let (cell, cam_x, cam_y) = layout(g);
+    let sw = screen_width();
+    let sh = screen_height();
+    let avail_w = sw - 24.0;
+    let avail_h = sh - HUD_H - 24.0;
+    let view_cx = 12.0 + avail_w / 2.0;
+    let view_cy = HUD_H + avail_h / 2.0;
+    // 世界坐标 -> 屏幕坐标：相机中心（cam_x, cam_y）落在视口中心
+    let ox = view_cx - cam_x * cell;
+    let oy = view_cy - cam_y * cell;
     let w = g.maze.width;
     let h = g.maze.height;
 
+    // 视口内的可见格子范围（大迷宫只绘制这一部分）
+    let half_cols = (avail_w / (2.0 * cell)).ceil() as i32 + 1;
+    let half_rows = (avail_h / (2.0 * cell)).ceil() as i32 + 1;
+    let x0 = ((cam_x - half_cols as f32).floor().max(0.0)) as usize;
+    let x1 = ((cam_x + half_cols as f32).ceil() as usize).min(w);
+    let y0 = ((cam_y - half_rows as f32).floor().max(0.0)) as usize;
+    let y1 = ((cam_y + half_rows as f32).ceil() as usize).min(h);
+
     // 地面（按视野光照混合：隔墙格子完全漆黑，视野内随距离渐暗至全黑）
-    for y in 0..h {
-        for x in 0..w {
+    for y in y0..y1 {
+        for x in x0..x1 {
             let base = if g.visited.contains(&(x, y)) {
                 FLOOR_VISITED
             } else {
@@ -649,7 +686,7 @@ fn draw(g: &Game) {
         }
     }
 
-    // 通关路线提示（H 键切换，随所在格光照变暗）
+    // 通关路线提示（H 键切换，随所在格光照变暗；视口外的线段由 GL 裁剪）
     if g.show_solution {
         for pair in g.solution.windows(2) {
             let (x1, y1) = pair[0];
@@ -666,8 +703,8 @@ fn draw(g: &Game) {
 
     // 墙壁（两侧任一格被照亮即可见，取较亮一侧：眼前的墙是视野剪影边界；
     // 两侧都黑的墙完全不可见）
-    for y in 0..h {
-        for x in 0..w {
+    for y in y0..y1 {
+        for x in x0..x1 {
             let fx = ox + x as f32 * cell;
             let fy = oy + y as f32 * cell;
             if g.maze.wall(x, y, N) {
@@ -685,30 +722,34 @@ fn draw(g: &Game) {
         }
     }
 
-    // 起点（进入视野才可见）
-    let sl = g.vision.cell_light[0];
-    let sc = if sl > 0.02 {
-        lerp_color(START, BG, 1.0 - sl)
-    } else {
-        BG
-    };
-    draw_circle(ox + 0.5 * cell, oy + 0.5 * cell, cell * 0.22, sc);
+    // 起点（进入视野才可见；视口外不绘制）
+    if x0 == 0 && y0 == 0 {
+        let sl = g.vision.cell_light[0];
+        let sc = if sl > 0.02 {
+            lerp_color(START, BG, 1.0 - sl)
+        } else {
+            BG
+        };
+        draw_circle(ox + 0.5 * cell, oy + 0.5 * cell, cell * 0.22, sc);
+    }
 
-    // 终点（进入视野才发光，隔墙时完全不可见）
+    // 终点（进入视野才发光，隔墙时完全不可见；视口外不绘制）
     let (gx, gy) = g.goal();
-    let gl = g.vision.cell_light[gx + gy * w];
-    let pulse = 1.0 + 0.12 * (get_time() as f32 * 4.0).sin() * gl;
-    let gc = if gl > 0.02 {
-        lerp_color(GOAL, BG, 1.0 - gl)
-    } else {
-        BG
-    };
-    draw_circle(
-        ox + (gx as f32 + 0.5) * cell,
-        oy + (gy as f32 + 0.5) * cell,
-        cell * 0.30 * pulse,
-        gc,
-    );
+    if gx >= x0 && gx < x1 && gy >= y0 && gy < y1 {
+        let gl = g.vision.cell_light[gx + gy * w];
+        let pulse = 1.0 + 0.12 * (get_time() as f32 * 4.0).sin() * gl;
+        let gc = if gl > 0.02 {
+            lerp_color(GOAL, BG, 1.0 - gl)
+        } else {
+            BG
+        };
+        draw_circle(
+            ox + (gx as f32 + 0.5) * cell,
+            oy + (gy as f32 + 0.5) * cell,
+            cell * 0.30 * pulse,
+            gc,
+        );
+    }
 
     // 玩家（带插值动画与柔和光晕）
     let px = ox + g.player_pos.0 * cell;
