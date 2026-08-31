@@ -1,0 +1,12 @@
+[package]
+name = "maze_game"
+version = "0.1.0"
+edition = "2021"
+description = "A 2D maze game built with Rust and macroquad"
+
+[dependencies]
+macroquad = "0.4"
+miniquad = "0.4"
+
+[profile.release]
+opt-level = 3
